@@ -43,6 +43,16 @@ func EndpointPath() (string, error) {
 	return filepath.Join(home, "endpoint.json"), nil
 }
 
+// IDARegistrationPath is the conventional IDA MCP registration location. A
+// daemon started without REA_IDA_MCP_CONFIG picks this file up when it exists.
+func IDARegistrationPath() (string, error) {
+	home, err := Home()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, "ida-mcp.json"), nil
+}
+
 // LogPath is where a detached daemon writes its stderr.
 func LogPath() (string, error) {
 	home, err := Home()

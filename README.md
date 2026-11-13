@@ -103,6 +103,40 @@ rea-session daemon stop && rea-session --rea-cmd ... status
 | `REA_SESSION_HOME` | State/log directory (default: user cache dir) |
 | `REA_MCP_TOOL_CATALOG_PROFILE` | Passed through to REA; see below |
 
+### IDA provider
+
+REA reaches IDA through an upstream `ida-pro-mcp` database supervisor. Generate
+its registration on a new machine:
+
+```bash
+python scripts/setup_ida.py
+```
+
+The script resolves the IDA installation (`--ida`, `IDADIR`, the persisted
+`ida-config.json`, PATH, then a shallow scan), resolves `idalib-mcp`, rejects
+builds that do not advertise `--stdio` and `--max-workers`, and writes the
+registration to `<REA_SESSION_HOME>/ida-mcp.json`
+(`%LOCALAPPDATA%\rea-session\ida-mcp.json` by default).
+
+A daemon started without `REA_IDA_MCP_CONFIG` picks that file up
+automatically, so no shell exports are required:
+
+```bash
+rea-session open /path/to/target --provider ida
+```
+
+An explicit `REA_IDA_MCP_CONFIG` always wins. The script never forces the
+analysis provider; `--provider ida`, `REA_ANALYSIS_PROVIDER`, or
+`open_binary.provider_id` still decides whether IDA is used.
+
+The upstream must serve REA's supervisor profile (`idb_open`, `idb_list`,
+`idb_close`). The enhancement fork that exposes only `idalib_*` is rejected:
+
+```bash
+python -m pip install --force-reinstall \
+  "git+https://github.com/mrexodia/ida-pro-mcp@c133c3853faa111a9b00ee615c013b720d0c4acd"
+```
+
 ## Design notes
 
 ### 1. The daemon owns the session, not the socket

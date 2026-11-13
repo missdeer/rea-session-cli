@@ -204,12 +204,32 @@ func spawn(cfg StartConfig) error {
 	cmd := exec.Command(exe, args...)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
-	cmd.Env = append(os.Environ(), "REA_SESSION_DAEMON=1")
+	cmd.Env = daemonEnv()
 	cmd.SysProcAttr = detachedProcAttr()
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start daemon: %w", err)
 	}
 	return cmd.Process.Release()
+}
+
+// daemonEnv builds the daemon environment. An explicit REA_IDA_MCP_CONFIG
+// always wins; otherwise the conventional <home>/ida-mcp.json is injected so
+// `rea-session open --provider ida` works without shell exports. The selected
+// analysis provider is never forced here: `--provider ida` (or
+// REA_ANALYSIS_PROVIDER) still decides whether IDA is used.
+func daemonEnv() []string {
+	env := append(os.Environ(), "REA_SESSION_DAEMON=1")
+	if os.Getenv("REA_IDA_MCP_CONFIG") != "" {
+		return env
+	}
+	path, err := state.IDARegistrationPath()
+	if err != nil {
+		return env
+	}
+	if _, err := os.Stat(path); err != nil {
+		return env
+	}
+	return append(env, "REA_IDA_MCP_CONFIG="+path)
 }
 
 // withSpawnLock makes concurrent CLI invocations race benignly: one spawns,
