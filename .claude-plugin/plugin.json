@@ -1,0 +1,16 @@
+{
+  "name": "rea-session",
+  "version": "0.1.0",
+  "description": "Drive REA through a warm background daemon without loading its tool catalog into context.",
+  "author": {
+    "name": "rea-session"
+  },
+  "license": "MIT",
+  "keywords": [
+    "reverse-engineering",
+    "mcp",
+    "cli",
+    "agent-skills"
+  ],
+  "skills": "./skills"
+}
