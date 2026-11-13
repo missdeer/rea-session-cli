@@ -30,12 +30,19 @@ type Config struct {
 type Server struct {
 	cfg     Config
 	ctx     context.Context
-	client  *mcp.Client
 	ln      net.Listener
 	token   string
 	started time.Time
 
 	mcpMu sync.Mutex
+
+	clientMu sync.RWMutex
+	client   *mcp.Client
+
+	phaseMu sync.Mutex
+	phase   string
+	initErr string
+	readyCh chan struct{}
 
 	toolsMu     sync.RWMutex
 	toolsJSON   json.RawMessage
@@ -67,24 +74,21 @@ func Run(ctx context.Context, cfg Config) error {
 		ctx:     ctx,
 		started: time.Now(),
 		done:    make(chan struct{}),
+		phase:   "starting",
+		readyCh: make(chan struct{}),
 	}
 	s.touch()
 
-	if err := s.startMCP(); err != nil {
-		_ = state.SaveError(fmt.Sprintf("cannot start the REA MCP server: %v", err))
-		return err
-	}
-
+	// Publish the control endpoint before the MCP handshake so the CLI can
+	// report progress instead of blocking with no observable state.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		_ = s.client.Close()
 		_ = state.SaveError(fmt.Sprintf("cannot listen on loopback: %v", err))
 		return fmt.Errorf("daemon: listen: %w", err)
 	}
 	token, err := state.NewToken()
 	if err != nil {
 		_ = ln.Close()
-		_ = s.client.Close()
 		_ = state.SaveError(fmt.Sprintf("cannot create a control token: %v", err))
 		return err
 	}
@@ -100,15 +104,15 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	if err := state.Save(ep); err != nil {
 		_ = ln.Close()
-		_ = s.client.Close()
 		_ = state.SaveError(fmt.Sprintf("cannot publish the control endpoint: %v", err))
 		return fmt.Errorf("daemon: publish endpoint: %w", err)
 	}
 	_ = state.ClearError()
 	defer func() { _ = state.Remove() }()
 
-	cfg.Logger.Printf("ready addr=%s pid=%d rea=%v", ep.Addr, ep.PID, cfg.ReaCommand)
+	cfg.Logger.Printf("control endpoint ready addr=%s pid=%d rea=%v", ep.Addr, ep.PID, cfg.ReaCommand)
 
+	go s.initialize()
 	go s.acceptLoop()
 	go s.idleLoop()
 
@@ -120,6 +124,65 @@ func Run(ctx context.Context, cfg Config) error {
 	return nil
 }
 
+// initialize owns the MCP handshake. The control socket is already serving so
+// status and doctor can show the "starting" phase while npx warms up.
+func (s *Server) initialize() {
+	defer close(s.readyCh)
+	if err := s.startMCP(); err != nil {
+		s.setPhase("failed", err.Error())
+		_ = state.SaveError(fmt.Sprintf("cannot start the REA MCP server: %v", err))
+		s.cfg.Logger.Printf("startup failed: %v", err)
+		return
+	}
+	s.setPhase("ready", "")
+	_ = state.ClearError()
+	s.touch()
+	s.cfg.Logger.Printf("ready")
+}
+
+func (s *Server) setPhase(phase, message string) {
+	s.phaseMu.Lock()
+	s.phase = phase
+	s.initErr = message
+	s.phaseMu.Unlock()
+}
+
+func (s *Server) phaseState() (string, string) {
+	s.phaseMu.Lock()
+	defer s.phaseMu.Unlock()
+	return s.phase, s.initErr
+}
+
+func (s *Server) waitReady(ctx context.Context) error {
+	select {
+	case <-s.readyCh:
+		phase, message := s.phaseState()
+		if phase == "ready" {
+			return nil
+		}
+		if message == "" {
+			message = "MCP initialization failed"
+		}
+		return errors.New(message)
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.done:
+		return errors.New("daemon stopped")
+	}
+}
+
+func (s *Server) setClient(client *mcp.Client) {
+	s.clientMu.Lock()
+	s.client = client
+	s.clientMu.Unlock()
+}
+
+func (s *Server) getClient() *mcp.Client {
+	s.clientMu.RLock()
+	defer s.clientMu.RUnlock()
+	return s.client
+}
+
 func (s *Server) startMCP() error {
 	client, err := mcp.Start(s.ctx, s.cfg.ReaCommand, func(format string, args ...any) {
 		s.cfg.Logger.Printf(format, args...)
@@ -127,7 +190,7 @@ func (s *Server) startMCP() error {
 	if err != nil {
 		return err
 	}
-	s.client = client
+	s.setClient(client)
 	client.SetNotificationHandler(func(method string, params json.RawMessage) {
 		switch method {
 		case "notifications/tools/list_changed":
@@ -210,8 +273,12 @@ func (s *Server) handleConn(conn net.Conn) {
 		s.writeResponse(conn, Response{OK: true, Result: json.RawMessage(`{}`)})
 
 	case OpTools:
-		ctx, cancel := context.WithTimeout(s.ctx, 2*time.Minute)
+		ctx, cancel := context.WithTimeout(s.ctx, 10*time.Minute)
 		defer cancel()
+		if err := s.waitReady(ctx); err != nil {
+			s.writeWaitFailure(conn, err)
+			return
+		}
 		raw, _, err := s.loadTools(ctx)
 		if err != nil {
 			s.writeResponse(conn, Response{OK: false, Code: CodeInternal, Error: err.Error()})
@@ -220,8 +287,12 @@ func (s *Server) handleConn(conn net.Conn) {
 		s.writeResponse(conn, Response{OK: true, Result: raw})
 
 	case OpSchema:
-		ctx, cancel := context.WithTimeout(s.ctx, 2*time.Minute)
+		ctx, cancel := context.WithTimeout(s.ctx, 10*time.Minute)
 		defer cancel()
+		if err := s.waitReady(ctx); err != nil {
+			s.writeWaitFailure(conn, err)
+			return
+		}
 		schema, err := s.describe(req.Tool, ctx)
 		if err != nil {
 			code := CodeInternal
@@ -261,6 +332,14 @@ func (s *Server) handleConn(conn net.Conn) {
 
 var errToolNotFound = errors.New("tool not found")
 
+func (s *Server) writeWaitFailure(conn net.Conn, err error) {
+	code := CodeInternal
+	if errors.Is(err, context.DeadlineExceeded) {
+		code = CodeTimeout
+	}
+	s.writeResponse(conn, Response{OK: false, Code: code, Error: err.Error()})
+}
+
 func (s *Server) callTool(req Request) (*mcp.CallResult, *Response) {
 	if req.Tool == "" {
 		return nil, &Response{OK: false, Code: CodeBadRequest, Error: "tool is required"}
@@ -271,9 +350,20 @@ func (s *Server) callTool(req Request) (*mcp.CallResult, *Response) {
 	}
 	ctx, cancel := context.WithTimeout(s.ctx, timeout)
 	defer cancel()
+	if err := s.waitReady(ctx); err != nil {
+		code := CodeToolError
+		if errors.Is(err, context.DeadlineExceeded) {
+			code = CodeTimeout
+		}
+		return nil, &Response{OK: false, Code: code, Error: err.Error()}
+	}
+	client := s.getClient()
+	if client == nil {
+		return nil, &Response{OK: false, Code: CodeInternal, Error: "MCP client is not available"}
+	}
 
 	s.mcpMu.Lock()
-	res, err := s.client.CallTool(ctx, req.Tool, req.Arguments)
+	res, err := client.CallTool(ctx, req.Tool, req.Arguments)
 	s.mcpMu.Unlock()
 	if err != nil {
 		code := CodeToolError
@@ -300,8 +390,12 @@ func (s *Server) loadTools(ctx context.Context) (json.RawMessage, int, error) {
 		return s.toolsJSON, s.toolsCount, nil
 	}
 
+	client := s.getClient()
+	if client == nil {
+		return nil, 0, errors.New("MCP client is not available")
+	}
 	s.mcpMu.Lock()
-	tools, err := s.client.ListTools(ctx)
+	tools, err := client.ListTools(ctx)
 	s.mcpMu.Unlock()
 	if err != nil {
 		return nil, 0, err
@@ -349,12 +443,21 @@ func (s *Server) status() ServerStatus {
 	count, loaded := s.toolsCount, s.toolsLoaded
 	s.toolsMu.RUnlock()
 
-	proto, info, _ := s.client.ServerInfo()
+	phase, initErr := s.phaseState()
+	proto := ""
+	var info mcp.ServerInfo
+	if phase == "ready" {
+		if client := s.getClient(); client != nil {
+			proto, info, _ = client.ServerInfo()
+		}
+	}
 	return ServerStatus{
 		PID:             os.Getpid(),
 		Addr:            s.ln.Addr().String(),
 		Running:         true,
 		Version:         s.cfg.Version,
+		Phase:           phase,
+		InitError:       initErr,
 		ProtocolVersion: proto,
 		ServerName:      info.Name,
 		ServerVersion:   info.Version,
@@ -408,8 +511,8 @@ func (s *Server) shutdown() {
 		if s.ln != nil {
 			_ = s.ln.Close()
 		}
-		if s.client != nil {
-			_ = s.client.Close()
+		if client := s.getClient(); client != nil {
+			_ = client.Close()
 		}
 		_ = state.Remove()
 		s.cfg.Logger.Printf("stopped")

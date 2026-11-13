@@ -164,12 +164,12 @@ func (a *app) rea() []string {
 	return defaultReaCommand()
 }
 
-func (a *app) ensure(ctx context.Context) (*state.Endpoint, error) {
+func (a *app) ensure(ctx context.Context, policy daemon.ReadyPolicy) (*state.Endpoint, error) {
 	return daemon.Ensure(ctx, daemon.StartConfig{
 		ReaCommand:  a.rea(),
 		IdleTimeout: a.idle,
 		Version:     a.version,
-	})
+	}, policy)
 }
 
 // ---------------------------------------------------------------- daemon
@@ -185,7 +185,7 @@ func (a *app) daemonCmd(args []string) int {
 	case "start":
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
-		ep, err := a.ensure(ctx)
+		ep, err := a.ensure(ctx, daemon.RequireRunning)
 		if err != nil {
 			a.fail(err)
 			return 3
@@ -330,9 +330,9 @@ func (a *app) toolsCmd(args []string) int {
 		return 2
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	ep, err := a.ensure(ctx)
+	ep, err := a.ensure(ctx, daemon.RequireReady)
 	if err != nil {
 		a.fail(err)
 		return 3
@@ -396,9 +396,9 @@ func (a *app) schemaCmd(args []string) int {
 		fmt.Fprintln(a.err, "rea-session schema: expected exactly one tool name")
 		return 2
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	ep, err := a.ensure(ctx)
+	ep, err := a.ensure(ctx, daemon.RequireReady)
 	if err != nil {
 		a.fail(err)
 		return 3
@@ -531,15 +531,18 @@ func (a *app) invoke(name string, args json.RawMessage, opts invokeOpts) int {
 	if opts.timeout <= 0 {
 		opts.timeout = 10 * time.Minute
 	}
-	// The socket deadline must outlast the daemon's own tool deadline.
-	ctx, cancel := context.WithTimeout(context.Background(), opts.timeout+30*time.Second)
-	defer cancel()
-
-	ep, err := a.ensure(ctx)
+	// Startup (npx cold start) is budgeted separately from the tool call.
+	startCtx, startCancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ep, err := a.ensure(startCtx, daemon.RequireReady)
+	startCancel()
 	if err != nil {
 		a.fail(err)
 		return 3
 	}
+
+	// The socket deadline must outlast the daemon's own tool deadline.
+	ctx, cancel := context.WithTimeout(context.Background(), opts.timeout+30*time.Second)
+	defer cancel()
 	resp, err := daemon.Do(ctx, ep, daemon.Request{
 		Op:        daemon.OpCall,
 		Tool:      name,
@@ -656,14 +659,21 @@ func (a *app) printStatus(status daemon.ServerStatus) {
 		"pid":            status.PID,
 		"addr":           status.Addr,
 		"rea":            status.ReaCommand,
-		"protocol":       status.ProtocolVersion,
-		"server":         status.ServerName + "/" + status.ServerVersion,
 		"tools":          status.Tools,
 		"tools_loaded":   status.ToolsLoaded,
 		"uptime_seconds": status.UptimeSeconds,
 	}
-	if status.ServerName == "" {
-		view["server"] = ""
+	if status.Phase != "" {
+		view["phase"] = status.Phase
+	}
+	if status.ProtocolVersion != "" {
+		view["protocol"] = status.ProtocolVersion
+	}
+	if status.ServerName != "" {
+		view["server"] = status.ServerName + "/" + status.ServerVersion
+	}
+	if status.InitError != "" {
+		view["init_error"] = status.InitError
 	}
 	a.printJSON(view, true)
 }

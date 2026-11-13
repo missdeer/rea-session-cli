@@ -31,6 +31,8 @@ type ServerStatus struct {
 	Addr            string    `json:"addr"`
 	Running         bool      `json:"running"`
 	Version         string    `json:"version"`
+	Phase           string    `json:"phase,omitempty"`
+	InitError       string    `json:"init_error,omitempty"`
 	ProtocolVersion string    `json:"protocol_version,omitempty"`
 	ServerName      string    `json:"server_name,omitempty"`
 	ServerVersion   string    `json:"server_version,omitempty"`

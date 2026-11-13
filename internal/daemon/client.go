@@ -22,8 +22,19 @@ type StartConfig struct {
 	Version     string
 }
 
+// ReadyPolicy controls how long Ensure waits after the daemon answers.
+type ReadyPolicy int
+
+const (
+	// RequireRunning returns as soon as the control socket answers, even while
+	// the MCP handshake is still in progress.
+	RequireRunning ReadyPolicy = iota
+	// RequireReady waits until the MCP handshake finished.
+	RequireReady
+)
+
 // Ensure returns a live endpoint, starting a detached daemon when needed.
-func Ensure(ctx context.Context, cfg StartConfig) (*state.Endpoint, error) {
+func Ensure(ctx context.Context, cfg StartConfig, policy ReadyPolicy) (*state.Endpoint, error) {
 	if len(cfg.ReaCommand) == 0 {
 		return nil, fmt.Errorf("no REA command configured")
 	}
@@ -31,30 +42,53 @@ func Ensure(ctx context.Context, cfg StartConfig) (*state.Endpoint, error) {
 		return nil, fmt.Errorf("REA command %q not found: %w", cfg.ReaCommand[0], err)
 	}
 
+	spawnNeeded := true
 	if ep, err := state.Load(); err == nil {
-		if alive(ctx, ep) {
+		responded, ok, inspectErr := inspectEndpoint(ctx, ep, policy)
+		if inspectErr != nil {
+			return nil, inspectErr
+		}
+		if ok {
 			return ep, nil
 		}
-		_ = state.Remove()
+		if responded {
+			// Alive but still starting: wait for it instead of spawning again.
+			spawnNeeded = false
+		} else {
+			_ = state.Remove()
+		}
 	}
 
-	// A stale failure record from an earlier run must not fail this attempt.
-	_ = state.ClearError()
-	if err := withSpawnLock(func() error { return spawn(cfg) }); err != nil {
-		return nil, err
+	if spawnNeeded {
+		// A stale failure record from an earlier run must not fail this attempt.
+		_ = state.ClearError()
+		if err := withSpawnLock(func() error { return spawn(cfg) }); err != nil {
+			return nil, err
+		}
 	}
 
 	// npx may need to fetch the package on first use, so allow a cold start.
-	const readyTimeout = 90 * time.Second
+	// RequireRunning only waits for the control socket, which is published
+	// before the handshake.
+	readyTimeout := 20 * time.Second
+	if policy == RequireReady {
+		readyTimeout = 5 * time.Minute
+	}
 	deadline := time.Now().Add(readyTimeout)
 	for {
-		// A daemon that dies before publishing leaves the precise reason here.
-		if message, err := state.LoadError(); err == nil && message != "" {
+		if ep, err := state.Load(); err == nil {
+			_, ok, inspectErr := inspectEndpoint(ctx, ep, policy)
+			if inspectErr != nil {
+				return nil, inspectErr
+			}
+			if ok {
+				return ep, nil
+			}
+		} else if message, err := state.LoadError(); err == nil && message != "" {
+			// The daemon died before publishing its endpoint.
 			return nil, errors.New(message)
 		}
-		if ep, err := state.Load(); err == nil && alive(ctx, ep) {
-			return ep, nil
-		}
+
 		if time.Now().After(deadline) {
 			logPath, _ := state.LogPath()
 			tail, _ := textutil.TailLines(logPath, 10)
@@ -69,6 +103,30 @@ func Ensure(ctx context.Context, cfg StartConfig) (*state.Endpoint, error) {
 			return nil, ctx.Err()
 		case <-time.After(250 * time.Millisecond):
 		}
+	}
+}
+
+// inspectEndpoint reports whether the daemon answered and whether it satisfies
+// the requested readiness policy. An error means initialization permanently
+// failed and the caller should stop waiting.
+func inspectEndpoint(ctx context.Context, ep *state.Endpoint, policy ReadyPolicy) (responded, ok bool, err error) {
+	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	resp, pingErr := Ping(pingCtx, ep)
+	if pingErr != nil {
+		return false, false, nil
+	}
+	switch resp.Server.Phase {
+	case "failed":
+		message := resp.Server.InitError
+		if message == "" {
+			message = "MCP initialization failed"
+		}
+		return true, false, errors.New(message)
+	case "", "ready":
+		return true, true, nil
+	default: // "starting"
+		return true, policy == RequireRunning, nil
 	}
 }
 
@@ -105,13 +163,6 @@ func Do(ctx context.Context, ep *state.Endpoint, req Request) (*Response, error)
 		return nil, err
 	}
 	return &resp, nil
-}
-
-func alive(ctx context.Context, ep *state.Endpoint) bool {
-	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	_, err := Ping(pingCtx, ep)
-	return err == nil
 }
 
 func spawn(cfg StartConfig) error {

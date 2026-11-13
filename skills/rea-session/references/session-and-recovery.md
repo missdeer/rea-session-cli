@@ -9,6 +9,10 @@ The first CLI command starts a detached daemon, which:
 3. publishes `endpoint.json` under `REA_SESSION_HOME`
 4. serves one request per loopback connection
 
+The control socket is published before the MCP handshake, so `status` reports
+`phase: "starting"` during a cold npx start and `phase: "ready"` once tools are
+usable. Real tool commands wait for `ready`; `daemon start` returns immediately.
+
 The daemon exits when `rea-session daemon stop` is called or after the idle
 timeout (default 20 minutes). Provider sessions, retained investigation
 records, and loaded catalog definitions do not survive daemon exit.

@@ -76,6 +76,11 @@ rea-session daemon stop
 The daemon starts on first use and exits after 20 minutes idle (configurable
 with `--idle`). Every command auto-starts it.
 
+`daemon run` is the foreground process; `daemon start` spawns it detached and
+returns as soon as the control socket is published, before the MCP handshake
+finishes. During a cold `npx` start, `status` reports `"phase": "starting"`
+and a real tool command waits for `"phase": "ready"`.
+
 ### Selecting the REA runtime
 
 ```bash

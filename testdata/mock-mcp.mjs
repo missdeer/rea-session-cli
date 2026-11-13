@@ -6,6 +6,9 @@ import readline from "node:readline";
 
 const send = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
 
+// MOCK_DELAY_MS simulates a cold provider startup in tests.
+const startDelay = Number(process.env.MOCK_DELAY_MS ?? 0);
+
 const tools = [
   {
     name: "open_binary",
@@ -36,15 +39,21 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     return;
   }
   if (message.method === "initialize") {
-    return send({
-      jsonrpc: "2.0",
-      id: message.id,
-      result: {
-        protocolVersion: "2025-06-18",
-        capabilities: { tools: {} },
-        serverInfo: { name: "mock-rea", version: "0.0.0" },
-      },
-    });
+    const reply = () =>
+      send({
+        jsonrpc: "2.0",
+        id: message.id,
+        result: {
+          protocolVersion: "2025-06-18",
+          capabilities: { tools: {} },
+          serverInfo: { name: "mock-rea", version: "0.0.0" },
+        },
+      });
+    if (startDelay > 0) {
+      setTimeout(reply, startDelay);
+      return;
+    }
+    return reply();
   }
   if (message.method === "notifications/initialized") return;
   if (message.method === "tools/list") {
