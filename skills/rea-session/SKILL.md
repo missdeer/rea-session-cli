@@ -66,15 +66,18 @@ rea-session tools --query firmware
 rea-session tools --query debugger
 ```
 
-Native questions normally begin with `open_binary`, then `binary_session`,
+Native workflows through REA normally begin with `open_binary`, then `binary_session`,
 `analyze_function`, `procedure_pseudo_code`, `search_strings`, or `xrefs`.
 Target-free inspection commands take a path argument and need no open call.
 
-#### Find IDA Pro on Windows
+#### Open an IDA Pro target on Windows
 
-When you need to locate IDA Pro executables, use `fd` first to search recursively
-from every Windows drive-letter root. Include hidden and ignored entries and
-return absolute paths.
+Prefer `ida-cli` for IDA Pro. Reuse a running broker or start `ida-cli serve`
+in a separate terminal, then run `ida-cli open "<binary-or-idb>"`.
+
+If `ida-cli` is unavailable or cannot locate IDA Pro automatically, use `fd`
+to search recursively from every Windows drive-letter root. Include hidden and
+ignored entries and return absolute paths.
 
 ```powershell
 $drives = Get-PSDrive -PSProvider FileSystem | Where-Object Root -Match '^[A-Z]:\\$'
@@ -89,6 +92,9 @@ the search with `--filesystem-walker` to scan the drive directly.
 If `fd` is unavailable, search the same roots with
 `Get-ChildItem -LiteralPath $drive.Root -Recurse -File -Force` and filter `Name`
 with the same pattern. Use the matching file's `FullName`.
+
+If `ida-cli` is available, retry with the GUI executable you found using
+`ida-cli open "<binary-or-idb>" --ida "<absolute-path-to-ida.exe>"`.
 
 ### 3. Load only what you need
 
