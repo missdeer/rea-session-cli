@@ -70,6 +70,26 @@ Native questions normally begin with `open_binary`, then `binary_session`,
 `analyze_function`, `procedure_pseudo_code`, `search_strings`, or `xrefs`.
 Target-free inspection commands take a path argument and need no open call.
 
+#### Find IDA Pro on Windows
+
+When you need to locate IDA Pro executables, use `fd` first to search recursively
+from every Windows drive-letter root. Include hidden and ignored entries and
+return absolute paths.
+
+```powershell
+$drives = Get-PSDrive -PSProvider FileSystem | Where-Object Root -Match '^[A-Z]:\\$'
+foreach ($drive in $drives) {
+    fd --absolute-path --unrestricted --ignore-case --type file --search-path $drive.Root '^ida[qt]?(64)?\.exe$'
+}
+```
+
+If `fd --version` reports `fde` and the index may have missed a match, rerun
+the search with `--filesystem-walker` to scan the drive directly.
+
+If `fd` is unavailable, search the same roots with
+`Get-ChildItem -LiteralPath $drive.Root -Recurse -File -Force` and filter `Name`
+with the same pattern. Use the matching file's `FullName`.
+
 ### 3. Load only what you need
 
 ```bash
